@@ -40,13 +40,9 @@ When streams are started, Dispatcharr always consumes connections from the prima
 
 ## Installation
 
-### Option 1: Upload Release Archive in Dispatcharr UI
-1. Download `trimarr.zip` from the latest GitHub Release (or build it locally: `mkdir -p build/trimarr && cp plugin.json plugin.py README.md build/trimarr/ && (cd build && zip -r ../trimarr.zip trimarr/)`).
+1. Download `trimarr.zip` from the latest GitHub Release.
 2. In Dispatcharr, navigate to **Settings → Plugins → Import Plugin** and upload `trimarr.zip`.
 3. Enable **Trimarr**.
-
-### Option 2: Volume Mount
-Copy `plugin.json` and `plugin.py` into `/data/plugins/trimarr/` inside your Dispatcharr container and restart Dispatcharr or reload plugins.
 
 ---
 
