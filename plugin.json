@@ -33,14 +33,6 @@
       ],
       "help_text": "How Trimarr breaks ties when multiple active profiles on a provider have the exact same lowest number of active connections.",
       "description": "How Trimarr breaks ties when multiple active profiles on a provider have the exact same lowest number of active connections."
-    },
-    {
-      "id": "track_unlimited_profiles",
-      "label": "Track Unlimited Profiles (max_streams = 0)",
-      "type": "boolean",
-      "default": true,
-      "help_text": "Increment connection counters in Redis even for profiles with max_streams=0 so unlimited profiles also load-balance evenly.",
-      "description": "Increment connection counters in Redis even for profiles with max_streams=0 so unlimited profiles also load-balance evenly."
     }
   ],
   "actions": [

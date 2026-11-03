@@ -19,7 +19,6 @@ _SELECTION_CTX = threading.local()
 DEFAULT_SETTINGS = {
     "enabled": True,
     "tie_breaker": "default_first",
-    "track_unlimited_profiles": True,
 }
 
 
@@ -128,14 +127,6 @@ class Plugin:
             ],
             "help_text": "How Trimarr breaks ties when multiple active profiles on a provider have the exact same lowest number of active connections.",
             "description": "How Trimarr breaks ties when multiple active profiles on a provider have the exact same lowest number of active connections.",
-        },
-        {
-            "id": "track_unlimited_profiles",
-            "label": "Track Unlimited Profiles (max_streams = 0)",
-            "type": "boolean",
-            "default": True,
-            "help_text": "Increment connection counters in Redis even for profiles with max_streams=0 so unlimited profiles also load-balance evenly.",
-            "description": "Increment connection counters in Redis even for profiles with max_streams=0 so unlimited profiles also load-balance evenly.",
         },
     ]
 
@@ -325,10 +316,9 @@ class Plugin:
 
     def _inject_hooks(self):
         """
-        Installs runtime wrappers across Dispatcharr's profile selection and connection pool modules.
+        Installs runtime wrappers across Dispatcharr's profile selection modules.
         """
         self._hook_queryset_iter()
-        self._hook_connection_pool()
         self._hook_channels_models()
         self._hook_live_proxy_url_utils()
         self._hook_vod_proxy_views()
@@ -374,61 +364,10 @@ class Plugin:
         patched_iter._is_trimarr_patched = True
         QuerySet.__iter__ = patched_iter
 
-    def _hook_connection_pool(self):
-        conn_pool = self._import_module("apps.m3u.connection_pool")
-        if conn_pool is None or not hasattr(conn_pool, "reserve_profile_slot"):
-            return
-
-        if not hasattr(conn_pool, "_trimarr_orig_reserve_profile_slot"):
-            conn_pool._trimarr_orig_reserve_profile_slot = conn_pool.reserve_profile_slot
-
-        orig_reserve = conn_pool._trimarr_orig_reserve_profile_slot
-
-        @wraps(orig_reserve)
-        def patched_reserve_profile_slot(profile, redis_client):
-            reserved, profile_count, failure_reason = orig_reserve(profile, redis_client)
-            if (
-                reserved
-                and getattr(profile, "max_streams", 0) == 0
-                and redis_client is not None
-                and ACTIVE_PLUGIN
-                and ACTIVE_PLUGIN.is_enabled()
-                and ACTIVE_PLUGIN.get_setting("track_unlimited_profiles", True)
-            ):
-                try:
-                    profile_key = conn_pool.profile_connections_key(profile.id)
-                    profile_count = int(redis_client.incr(profile_key))
-                except Exception as exc:
-                    logger.debug("[Trimarr] Could not increment unlimited profile counter: %s", exc)
-            return reserved, profile_count, failure_reason
-
-        patched_reserve_profile_slot._is_trimarr_patched = True
-        conn_pool.reserve_profile_slot = patched_reserve_profile_slot
-
-        # Update direct function references in modules that imported reserve_profile_slot by value
-        for mod_name in ("apps.channels.models", "apps.timeshift.views"):
-            mod = sys.modules.get(mod_name)
-            if mod is not None and hasattr(mod, "reserve_profile_slot"):
-                if not hasattr(mod, "_trimarr_orig_reserve_profile_slot"):
-                    mod._trimarr_orig_reserve_profile_slot = mod.reserve_profile_slot
-                mod.reserve_profile_slot = patched_reserve_profile_slot
-
     def _hook_channels_models(self):
         channels_mod = self._import_module("apps.channels.models")
         if channels_mod is None:
             return
-
-        # Ensure reserve_profile_slot binding is updated if channels.models was just imported
-        conn_pool = sys.modules.get("apps.m3u.connection_pool")
-        if (
-            conn_pool is not None
-            and hasattr(conn_pool, "reserve_profile_slot")
-            and getattr(conn_pool.reserve_profile_slot, "_is_trimarr_patched", False)
-            and hasattr(channels_mod, "reserve_profile_slot")
-        ):
-            if not hasattr(channels_mod, "_trimarr_orig_reserve_profile_slot"):
-                channels_mod._trimarr_orig_reserve_profile_slot = channels_mod.reserve_profile_slot
-            channels_mod.reserve_profile_slot = conn_pool.reserve_profile_slot
 
         # Hook Channel.get_stream
         Channel = getattr(channels_mod, "Channel", None)
@@ -615,21 +554,7 @@ class Plugin:
 
     def _hook_timeshift_views(self):
         ts_views = self._import_module("apps.timeshift.views")
-        if ts_views is None:
-            return
-
-        conn_pool = sys.modules.get("apps.m3u.connection_pool")
-        if (
-            conn_pool is not None
-            and hasattr(conn_pool, "reserve_profile_slot")
-            and getattr(conn_pool.reserve_profile_slot, "_is_trimarr_patched", False)
-            and hasattr(ts_views, "reserve_profile_slot")
-        ):
-            if not hasattr(ts_views, "_trimarr_orig_reserve_profile_slot"):
-                ts_views._trimarr_orig_reserve_profile_slot = ts_views.reserve_profile_slot
-            ts_views.reserve_profile_slot = conn_pool.reserve_profile_slot
-
-        if not hasattr(ts_views, "_prepare_catchup_stream_attempt"):
+        if ts_views is None or not hasattr(ts_views, "_prepare_catchup_stream_attempt"):
             return
 
         if not hasattr(ts_views, "_trimarr_orig_prepare_catchup_stream_attempt"):
@@ -769,16 +694,8 @@ class Plugin:
             if hasattr(QuerySet, "_trimarr_orig_iter"):
                 QuerySet.__iter__ = QuerySet._trimarr_orig_iter
 
-        conn_pool = sys.modules.get("apps.m3u.connection_pool")
-        if conn_pool is not None and hasattr(conn_pool, "_trimarr_orig_reserve_profile_slot"):
-            conn_pool.reserve_profile_slot = conn_pool._trimarr_orig_reserve_profile_slot
-
         channels_mod = sys.modules.get("apps.channels.models")
         if channels_mod is not None:
-            if hasattr(channels_mod, "_trimarr_orig_reserve_profile_slot"):
-                channels_mod.reserve_profile_slot = (
-                    channels_mod._trimarr_orig_reserve_profile_slot
-                )
             Channel = getattr(channels_mod, "Channel", None)
             if Channel is not None and hasattr(Channel, "_trimarr_orig_get_stream"):
                 Channel.get_stream = Channel._trimarr_orig_get_stream
@@ -802,13 +719,12 @@ class Plugin:
             vod_views._get_m3u_profile = vod_views._trimarr_orig_get_m3u_profile
 
         ts_views = sys.modules.get("apps.timeshift.views")
-        if ts_views is not None:
-            if hasattr(ts_views, "_trimarr_orig_reserve_profile_slot"):
-                ts_views.reserve_profile_slot = ts_views._trimarr_orig_reserve_profile_slot
-            if hasattr(ts_views, "_trimarr_orig_prepare_catchup_stream_attempt"):
-                ts_views._prepare_catchup_stream_attempt = (
-                    ts_views._trimarr_orig_prepare_catchup_stream_attempt
-                )
+        if ts_views is not None and hasattr(
+            ts_views, "_trimarr_orig_prepare_catchup_stream_attempt"
+        ):
+            ts_views._prepare_catchup_stream_attempt = (
+                ts_views._trimarr_orig_prepare_catchup_stream_attempt
+            )
 
         m3u_utils = sys.modules.get("apps.m3u.utils")
         if m3u_utils is not None and hasattr(
@@ -831,13 +747,6 @@ class Plugin:
             qs_mod is not None
             and hasattr(qs_mod, "QuerySet")
             and getattr(qs_mod.QuerySet.__iter__, "_is_trimarr_patched", False)
-        )
-
-        conn_pool = sys.modules.get("apps.m3u.connection_pool")
-        states["connection_pool"] = bool(
-            conn_pool is not None
-            and hasattr(conn_pool, "reserve_profile_slot")
-            and getattr(conn_pool.reserve_profile_slot, "_is_trimarr_patched", False)
         )
 
         channels_mod = sys.modules.get("apps.channels.models")
@@ -891,7 +800,6 @@ class Plugin:
             any_hooked = any(hook_states.values())
             enabled = self.is_enabled()
             tie_breaker = self.get_setting("tie_breaker", "default_first")
-            track_unlimited = self.get_setting("track_unlimited_profiles", True)
 
             hook_summary = ", ".join(
                 f"{k}={'ok' if v else 'unhooked'}" for k, v in hook_states.items()
@@ -902,10 +810,9 @@ class Plugin:
                 "is_hooked": any_hooked,
                 "hook_states": hook_states,
                 "tie_breaker": tie_breaker,
-                "track_unlimited_profiles": bool(track_unlimited),
                 "message": (
                     f"Trimarr is {'ACTIVE' if (enabled and any_hooked) else 'DISABLED or unhooked'} "
-                    f"(tie_breaker={tie_breaker}, track_unlimited={bool(track_unlimited)}). "
+                    f"(tie_breaker={tie_breaker}). "
                     f"Hooks: [{hook_summary}]"
                 ),
             }

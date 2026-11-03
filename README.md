@@ -30,7 +30,6 @@ When streams are started, Dispatcharr always consumes connections from the prima
   - **VOD Movies & Series Episodes** (`_get_m3u_profile`, while preserving existing VOD session stickiness for mid-playback HTTP `Range` requests)
   - **Timeshift / Catch-up TV** (`_prepare_catchup_stream_attempt`, while preserving the default profile's `server_info` timezone)
   - **User Profile Allowlists** (`get_allowed_m3u_profiles`)
-- **Unlimited Profile Tracking (`max_streams = 0`)**: Optionally increments Redis counters for unlimited profiles so they also balance evenly.
 - **Configurable Tie-Breaker**:
   - **Default Profile First (`default_first`)**: Deterministic tie-breaking (default profile first, then ascending profile ID).
   - **Lowest Capacity Utilization Ratio (`utilization`)**: Prefers the profile with the lowest `active / max_streams` percentage when tied on raw connection count.
@@ -58,10 +57,9 @@ Copy `plugin.json` and `plugin.py` into `/data/plugins/trimarr/` inside your Dis
 | :--- | :--- | :--- |
 | **Enable Trimarr Load Balancer** (`enabled`) | `true` | Master toggle to enable least-connections profile selection. When disabled, Dispatcharr immediately reverts to standard linear failover. |
 | **Tie-Breaker Strategy** (`tie_breaker`) | `default_first` | How ties are broken when multiple profiles share the lowest active connection count (`default_first`, `utilization`, or `random`). |
-| **Track Unlimited Profiles** (`track_unlimited_profiles`) | `true` | Tracks active connections in Redis even when a profile has `max_streams = 0` so unlimited profiles also balance evenly. |
 
 ### UI Actions
-- **Check Status (`status_check`)**: Verifies whether Trimarr is enabled and confirms that all runtime hooks (`queryset_iter`, `connection_pool`, `channels`, `live_proxy`, `vod_proxy`, `timeshift`, `m3u_utils`) are active.
+- **Check Status (`status_check`)**: Verifies whether Trimarr is enabled and confirms that all runtime hooks (`queryset_iter`, `channels`, `live_proxy`, `vod_proxy`, `timeshift`, `m3u_utils`) are active.
 - **Inspect Load (`inspect_profiles`)**: Queries all active M3U accounts and displays live Redis connection counts (`active / max_streams`) for every profile along with the profile that will be chosen for the next connection.
 
 ---

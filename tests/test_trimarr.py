@@ -515,26 +515,6 @@ class TestTrimarrPlugin(unittest.TestCase):
         allowed = m3u_utils.get_allowed_m3u_profiles(user=SimpleNamespace())
         self.assertEqual([p.id for p in allowed[10]], [103, 102, 101])
 
-    def test_unlimited_profiles_tracked_and_balanced(self):
-        """
-        Verify that profiles with max_streams=0 (unlimited) still increment Redis counters
-        when track_unlimited_profiles=True so they load-balance evenly.
-        """
-        self.prof1.max_streams = 0
-        self.prof2.max_streams = 0
-        self.prof3.max_streams = 0
-
-        Channel = sys.modules["apps.channels.models"].Channel
-        chan = Channel(self.account)
-
-        _, p1, _, _ = chan.get_stream()
-        _, p2, _, _ = chan.get_stream()
-        _, p3, _, _ = chan.get_stream()
-        self.assertEqual([p1, p2, p3], [101, 102, 103])
-        self.assertEqual(int(self.fake_redis.get("profile_connections:101")), 1)
-        self.assertEqual(int(self.fake_redis.get("profile_connections:102")), 1)
-        self.assertEqual(int(self.fake_redis.get("profile_connections:103")), 1)
-
     def test_utilization_tie_breaker(self):
         """
         When tied at 1 active connection, `utilization` tie-breaker prefers the profile
