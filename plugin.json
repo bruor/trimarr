@@ -1,0 +1,64 @@
+{
+  "name": "Trimarr",
+  "version": "1.0.0",
+  "description": "Load-balances provider connections across all active M3U account profiles using least-connections selection instead of linear failover.",
+  "author": "bruor",
+  "fields": [
+    {
+      "id": "enabled",
+      "label": "Enable Trimarr Load Balancer",
+      "type": "boolean",
+      "default": true,
+      "help_text": "Master switch to enable least-connections load balancing across M3U account profiles instead of Dispatcharr's default linear failover.",
+      "description": "Master switch to enable least-connections load balancing across M3U account profiles instead of Dispatcharr's default linear failover."
+    },
+    {
+      "id": "tie_breaker",
+      "label": "Tie-Breaker Strategy",
+      "type": "select",
+      "default": "default_first",
+      "options": [
+        {
+          "value": "default_first",
+          "label": "Default Profile First (Deterministic)"
+        },
+        {
+          "value": "utilization",
+          "label": "Lowest Capacity Utilization Ratio (%)"
+        },
+        {
+          "value": "random",
+          "label": "Random (Even Wear Across Tied Profiles)"
+        }
+      ],
+      "help_text": "How Trimarr breaks ties when multiple active profiles on a provider have the exact same lowest number of active connections.",
+      "description": "How Trimarr breaks ties when multiple active profiles on a provider have the exact same lowest number of active connections."
+    },
+    {
+      "id": "track_unlimited_profiles",
+      "label": "Track Unlimited Profiles (max_streams = 0)",
+      "type": "boolean",
+      "default": true,
+      "help_text": "Increment connection counters in Redis even for profiles with max_streams=0 so unlimited profiles also load-balance evenly.",
+      "description": "Increment connection counters in Redis even for profiles with max_streams=0 so unlimited profiles also load-balance evenly."
+    }
+  ],
+  "actions": [
+    {
+      "id": "status_check",
+      "label": "Check Hook Status",
+      "description": "Verify Trimarr load balancer status, active settings, and runtime hook state across Dispatcharr modules.",
+      "button_label": "Check Status",
+      "button_variant": "filled",
+      "button_color": "blue"
+    },
+    {
+      "id": "inspect_profiles",
+      "label": "Inspect Profile Load",
+      "description": "View live Redis connection counts across all active M3U accounts and profiles and see which profile will be selected next.",
+      "button_label": "Inspect Load",
+      "button_variant": "outline",
+      "button_color": "green"
+    }
+  ]
+}

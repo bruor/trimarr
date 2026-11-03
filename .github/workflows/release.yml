@@ -1,0 +1,35 @@
+name: Release Plugin
+
+on:
+  push:
+    tags:
+      - 'v*'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Package Trimarr zip
+        run: |
+          mkdir -p build/trimarr
+          cp plugin.json plugin.py README.md build/trimarr/
+          cd build && zip -r ../trimarr.zip trimarr/
+          cd ..
+          sha256sum trimarr.zip > trimarr.zip.sha256
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            trimarr.zip
+            trimarr.zip.sha256
+          generate_release_notes: true

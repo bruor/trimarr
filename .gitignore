@@ -1,0 +1,24 @@
+# Reference repositories & symlinks (for local dev & analysis)
+/dispatcharr
+/dispatcharr/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Release archives
+*.zip
+*.sha256
+dist/
+build/
