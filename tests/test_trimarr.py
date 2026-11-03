@@ -41,11 +41,18 @@ class FakeProfileQuerySet:
 
     model = M3UAccountProfile
 
-    def __init__(self, items):
+    def __init__(self, items, model=None):
         self._items = list(items)
+        if model is not None:
+            self.model = model
 
     def __iter__(self):
         return iter(self._items)
+
+    def __getitem__(self, k):
+        if isinstance(k, slice):
+            return FakeProfileQuerySet(self._items[k], model=self.model)
+        return self._items[k]
 
     def filter(self, **kwargs):
         filtered = list(self._items)
@@ -58,13 +65,19 @@ class FakeProfileQuerySet:
         if "id__in" in kwargs:
             allowed = set(kwargs["id__in"])
             filtered = [p for p in filtered if p.id in allowed]
-        return FakeProfileQuerySet(filtered)
+        return FakeProfileQuerySet(filtered, model=self.model)
 
     def select_related(self, *args, **kwargs):
         return self
 
+    def order_by(self, *args, **kwargs):
+        return self
+
     def first(self):
-        return self._items[0] if self._items else None
+        # Match real Django's QuerySet.first() which iterates self[:1] via QuerySet.__iter__
+        for obj in self[:1]:
+            return obj
+        return None
 
     def get(self, **kwargs):
         res = self.filter(**kwargs).first()
@@ -73,7 +86,7 @@ class FakeProfileQuerySet:
         return res
 
     def all(self):
-        return FakeProfileQuerySet(self._items)
+        return FakeProfileQuerySet(self._items, model=self.model)
 
 
 class TestTrimarrPlugin(unittest.TestCase):
@@ -193,23 +206,29 @@ class TestTrimarrPlugin(unittest.TestCase):
                 self.id = 1
                 self.uuid = "chan-uuid-1"
                 self.account = account
+                self.streams = FakeProfileQuerySet(
+                    [SimpleNamespace(id=999, m3u_account=account)],
+                    model=SimpleNamespace(__name__="Stream"),
+                )
 
             def get_stream(self, requester=None, allowed_m3u_profiles=None):
-                m3u_profiles = self.account.profiles.filter(is_active=True)
-                default_profile = next(
-                    (obj for obj in m3u_profiles if obj.is_default), None
-                )
-                if not default_profile:
-                    return None, None, "No active profiles", False
-                profiles = [default_profile] + [
-                    obj for obj in m3u_profiles if not obj.is_default
-                ]
-                for profile in profiles:
-                    reserved, _count, _reason = mock_channels_models.reserve_profile_slot(
-                        profile, self.account._redis
+                for stream in self.streams.all().order_by("channelstream__order"):
+                    m3u_account = stream.m3u_account
+                    m3u_profiles = m3u_account.profiles.filter(is_active=True)
+                    default_profile = next(
+                        (obj for obj in m3u_profiles if obj.is_default), None
                     )
-                    if reserved:
-                        return 999, profile.id, None, True
+                    if not default_profile:
+                        continue
+                    profiles = [default_profile] + [
+                        obj for obj in m3u_profiles if not obj.is_default
+                    ]
+                    for profile in profiles:
+                        reserved, _count, _reason = mock_channels_models.reserve_profile_slot(
+                            profile, m3u_account._redis
+                        )
+                        if reserved:
+                            return stream.id, profile.id, None, True
                 return None, None, "All active M3U profiles have reached maximum connection limits", False
 
         class FakeStream:
@@ -593,15 +612,22 @@ class TestTrimarrPlugin(unittest.TestCase):
     def test_live_db_settings_update_not_stale_cached(self):
         """
         Verify that updating PluginConfig.settings in Dispatcharr's database
-        is immediately reflected on the very next stream selection without restart.
+        is immediately reflected on the very next stream selection without restart,
+        and that evaluating PluginConfig.objects.filter(...).first() via QuerySet.__iter__
+        inside a selection context never causes infinite recursion.
         """
+        class FakePluginConfigModel:
+            pass
+
         mock_config = MagicMock()
         mock_config.enabled = True
         mock_config.settings = {"enabled": True, "tie_breaker": "default_first"}
 
         mock_models = types.ModuleType("apps.plugins.models")
         mock_plugin_config_cls = MagicMock()
-        mock_plugin_config_cls.objects.filter.return_value.first.return_value = mock_config
+        mock_plugin_config_cls.objects.filter.side_effect = (
+            lambda **kw: FakeProfileQuerySet([mock_config], model=FakePluginConfigModel)
+        )
         mock_models.PluginConfig = mock_plugin_config_cls
         sys.modules["apps.plugins.models"] = mock_models
 

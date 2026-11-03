@@ -57,7 +57,12 @@ def _reorder_profiles_for_default_walk(profiles_iterable) -> list:
     produces the exact least-connections walk order without mutating ORM cache instances.
     """
     items = list(profiles_iterable)
-    if len(items) <= 1 or not ACTIVE_PLUGIN or not ACTIVE_PLUGIN.is_enabled():
+    if (
+        len(items) <= 1
+        or not hasattr(items[0], "is_default")
+        or not ACTIVE_PLUGIN
+        or not ACTIVE_PLUGIN.is_enabled()
+    ):
         return items
 
     with _pause_selection_context():
@@ -181,38 +186,40 @@ class Plugin:
         Look up the persisted PluginConfig row from Dispatcharr's database.
         Matches by module key (if loaded as `_dispatcharr_plugin_<key>.plugin` or `plugins.<key>`),
         `key='trimarr'`, or `name='Trimarr'`.
+        Always pauses `_SELECTION_CTX` so querying PluginConfig never triggers `patched_iter`.
         """
-        try:
-            from apps.plugins.models import PluginConfig
+        with _pause_selection_context():
+            try:
+                from apps.plugins.models import PluginConfig
 
-            if __name__.startswith("_dispatcharr_plugin_"):
-                runtime_key = __name__[len("_dispatcharr_plugin_") :].split(".", 1)[0]
-                config = PluginConfig.objects.filter(key=runtime_key).first()
+                if __name__.startswith("_dispatcharr_plugin_"):
+                    runtime_key = __name__[len("_dispatcharr_plugin_") :].split(".", 1)[0]
+                    config = PluginConfig.objects.filter(key=runtime_key).first()
+                    if config is not None:
+                        return config
+
+                if __name__.startswith("plugins."):
+                    runtime_key = __name__.split(".", 1)[1]
+                    config = PluginConfig.objects.filter(key=runtime_key).first()
+                    if config is not None:
+                        return config
+
+                config = PluginConfig.objects.filter(key__iexact="trimarr").first()
                 if config is not None:
                     return config
 
-            if __name__.startswith("plugins."):
-                runtime_key = __name__.split(".", 1)[1]
-                config = PluginConfig.objects.filter(key=runtime_key).first()
-                if config is not None:
-                    return config
+                return PluginConfig.objects.filter(name__iexact="trimarr").first()
+            except Exception:
+                return None
 
-            config = PluginConfig.objects.filter(key__iexact="trimarr").first()
-            if config is not None:
-                return config
-
-            return PluginConfig.objects.filter(name__iexact="trimarr").first()
-        except Exception:
-            return None
-
-    def get_setting(self, key: str, default=None):
+    def get_setting(self, key: str, default=None, _config=None):
         """
         Retrieves a plugin setting.
         Always queries Dispatcharr's persisted PluginConfig first so settings updates
         made in the UI take effect immediately across all uWSGI worker processes.
         Falls back to in-memory `_cached_settings` and then `DEFAULT_SETTINGS`.
         """
-        config = self._get_plugin_config()
+        config = _config if _config is not None else self._get_plugin_config()
         if config is not None and isinstance(config.settings, dict):
             val = config.settings.get(key)
             if val is not None:
@@ -231,7 +238,7 @@ class Plugin:
         if config is not None and not config.enabled:
             return False
 
-        val = self.get_setting("enabled", True)
+        val = self.get_setting("enabled", True, _config=config)
         if isinstance(val, bool):
             return val
         if isinstance(val, str):
@@ -338,7 +345,11 @@ class Plugin:
 
         @wraps(orig_iter)
         def patched_iter(qs_self):
-            if not _in_selection_context() or not ACTIVE_PLUGIN or not ACTIVE_PLUGIN.is_enabled():
+            # Fast-path checks MUST NOT trigger any database queries (such as is_enabled()),
+            # because Django's `.first()` / `.exists()` / QuerySet evaluation itself calls
+            # `QuerySet.__iter__`, which would cause infinite recursion if `_in_selection_context()`
+            # is active.
+            if not _in_selection_context() or ACTIVE_PLUGIN is None:
                 return orig_iter(qs_self)
 
             model = getattr(qs_self, "model", None)
@@ -346,20 +357,24 @@ class Plugin:
             if model_name != "M3UAccountProfile":
                 return orig_iter(qs_self)
 
-            # Cache the reordered list on this specific QuerySet instance so two back-to-back
-            # iterations of `m3u_profiles` (finding `default_profile` then `[not is_default]`)
-            # always see the exact same order, even when `tie_breaker="random"` is active.
-            cached = getattr(qs_self, "_trimarr_reordered_cache", None)
-            if cached is not None:
-                return iter(cached)
+            with _pause_selection_context():
+                if not ACTIVE_PLUGIN.is_enabled():
+                    return orig_iter(qs_self)
 
-            raw_items = list(orig_iter(qs_self))
-            reordered = _reorder_profiles_for_default_walk(raw_items)
-            try:
-                qs_self._trimarr_reordered_cache = reordered
-            except Exception:
-                pass
-            return iter(reordered)
+                # Cache the reordered list on this specific QuerySet instance so two back-to-back
+                # iterations of `m3u_profiles` (finding `default_profile` then `[not is_default]`)
+                # always see the exact same order, even when `tie_breaker="random"` is active.
+                cached = getattr(qs_self, "_trimarr_reordered_cache", None)
+                if cached is not None:
+                    return iter(cached)
+
+                raw_items = list(orig_iter(qs_self))
+                reordered = _reorder_profiles_for_default_walk(raw_items)
+                try:
+                    qs_self._trimarr_reordered_cache = reordered
+                except Exception:
+                    pass
+                return iter(reordered)
 
         patched_iter._is_trimarr_patched = True
         QuerySet.__iter__ = patched_iter
@@ -654,29 +669,30 @@ class Plugin:
 
         @wraps(orig_get_allowed)
         def patched_get_allowed_m3u_profiles(user):
-            profiles_by_account = orig_get_allowed(user)
-            if (
-                not ACTIVE_PLUGIN
-                or not ACTIVE_PLUGIN.is_enabled()
-                or not isinstance(profiles_by_account, dict)
-                or not profiles_by_account
-            ):
-                return profiles_by_account
+            with _pause_selection_context():
+                profiles_by_account = orig_get_allowed(user)
+                if (
+                    not ACTIVE_PLUGIN
+                    or not ACTIVE_PLUGIN.is_enabled()
+                    or not isinstance(profiles_by_account, dict)
+                    or not profiles_by_account
+                ):
+                    return profiles_by_account
 
-            try:
-                redis_client = ACTIVE_PLUGIN._get_redis_client()
-                if redis_client is not None:
-                    for account_id, prof_list in list(profiles_by_account.items()):
-                        if len(prof_list) > 1:
-                            profiles_by_account[account_id] = (
-                                ACTIVE_PLUGIN.sort_profiles_least_used(
-                                    prof_list, redis_client
+                try:
+                    redis_client = ACTIVE_PLUGIN._get_redis_client()
+                    if redis_client is not None:
+                        for account_id, prof_list in list(profiles_by_account.items()):
+                            if len(prof_list) > 1:
+                                profiles_by_account[account_id] = (
+                                    ACTIVE_PLUGIN.sort_profiles_least_used(
+                                        prof_list, redis_client
+                                    )
                                 )
-                            )
-            except Exception as exc:
-                logger.debug("[Trimarr] Error sorting allowed M3U profiles: %s", exc)
+                except Exception as exc:
+                    logger.debug("[Trimarr] Error sorting allowed M3U profiles: %s", exc)
 
-            return profiles_by_account
+                return profiles_by_account
 
         patched_get_allowed_m3u_profiles._is_trimarr_patched = True
         m3u_utils.get_allowed_m3u_profiles = patched_get_allowed_m3u_profiles
