@@ -2,10 +2,8 @@ name: Release Plugin
 
 on:
   push:
-    tags:
-      - 'v*'
-  release:
-    types: [published]
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -18,18 +16,58 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Determine release version
+        id: version
+        run: |
+          BASE_VER=$(python3 -c 'import json; v=json.load(open("plugin.json"))["version"].split("."); print(f"{v[0]}.{v[1]}")')
+          RELEASE_VER="${BASE_VER}.${GITHUB_RUN_NUMBER}"
+          echo "version=${RELEASE_VER}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${RELEASE_VER}" >> "$GITHUB_OUTPUT"
+
       - name: Package Trimarr zip
+        env:
+          RELEASE_VER: ${{ steps.version.outputs.version }}
         run: |
           mkdir -p build/trimarr
           cp plugin.json plugin.py README.md build/trimarr/
+          python3 - << 'EOF'
+          import json, os, re
+
+          ver = os.environ["RELEASE_VER"]
+
+          with open("build/trimarr/plugin.json", "r", encoding="utf-8") as f:
+              manifest = json.load(f)
+          manifest["version"] = ver
+          with open("build/trimarr/plugin.json", "w", encoding="utf-8") as f:
+              json.dump(manifest, f, indent=2)
+              f.write("\n")
+
+          with open("build/trimarr/plugin.py", "r", encoding="utf-8") as f:
+              code = f.read()
+          code = re.sub(r'(^\s*version\s*=\s*)"[^"]*"', f'\\1"{ver}"', code, count=1, flags=re.MULTILINE)
+          with open("build/trimarr/plugin.py", "w", encoding="utf-8") as f:
+              f.write(code)
+          EOF
           cd build && zip -r ../trimarr.zip trimarr/
           cd ..
           sha256sum trimarr.zip > trimarr.zip.sha256
 
-      - name: Upload Release Asset
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Trimarr ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: |
             trimarr.zip
             trimarr.zip.sha256
           generate_release_notes: true
+          make_latest: true
