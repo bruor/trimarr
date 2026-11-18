@@ -53,6 +53,15 @@ When streams are started, Dispatcharr always consumes connections from the prima
 | :--- | :--- | :--- |
 | **Enable Trimarr Load Balancer** (`enabled`) | `true` | Master toggle to enable least-connections profile selection. When disabled, Dispatcharr immediately reverts to standard linear failover. |
 | **Tie-Breaker Strategy** (`tie_breaker`) | `default_first` | How ties are broken when multiple profiles share the lowest active connection count (`default_first`, `utilization`, or `random`). |
+| **Logging Level** (`log_level`) | `standard` | Controls what Trimarr writes to Dispatcharr's logs: `standard` (overrides, lifecycle & warnings), `verbose` (all evaluations, stickiness & overrides), or `errors` (warnings & failures only). |
+
+### Logging
+
+Trimarr writes structured entries to Dispatcharr's central log stream (`[Trimarr]`), so events appear alongside core proxy logs without extra configuration. Under the default `standard` level, Trimarr logs whenever it overrides Dispatcharr's default profile choice and shows the load breakdown across profiles:
+
+```text
+[Trimarr] [live:Channel.get_stream] Account 'Provider Alpha' (id=10): OVERRIDE default 'cred1' (id=101) [cred1*(1/3)] -> selected 'cred2' (id=102) [cred2(0/3)] [tie_breaker=default_first; order: cred2(0/3), cred3(1/3), cred1*(1/3)]
+```
 
 ### UI Actions
 - **Check Status (`status_check`)**: Verifies whether Trimarr is enabled and confirms that all runtime hooks (`queryset_iter`, `channels`, `live_proxy`, `vod_proxy`, `timeshift`, `m3u_utils`) are active.

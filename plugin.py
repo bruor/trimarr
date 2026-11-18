@@ -1,5 +1,6 @@
 import copy
 import logging
+import os
 import random
 import sys
 import threading
@@ -19,33 +20,51 @@ _SELECTION_CTX = threading.local()
 DEFAULT_SETTINGS = {
     "enabled": True,
     "tie_breaker": "default_first",
+    "log_level": "standard",
 }
+
+VALID_LOG_LEVELS = {"standard", "verbose", "errors"}
 
 
 def _in_selection_context() -> bool:
     return getattr(_SELECTION_CTX, "depth", 0) > 0
 
 
+def _current_selection_source() -> str:
+    sources = getattr(_SELECTION_CTX, "sources", None)
+    return sources[-1] if sources else "live"
+
+
 @contextmanager
-def _profile_selection_context():
+def _profile_selection_context(source: str = "live"):
     _SELECTION_CTX.depth = getattr(_SELECTION_CTX, "depth", 0) + 1
+    sources = getattr(_SELECTION_CTX, "sources", None)
+    if sources is None:
+        sources = []
+        _SELECTION_CTX.sources = sources
+    sources.append(source)
     try:
         yield
     finally:
         _SELECTION_CTX.depth = max(0, getattr(_SELECTION_CTX, "depth", 1) - 1)
+        if sources:
+            sources.pop()
 
 
 @contextmanager
 def _pause_selection_context():
-    prev = getattr(_SELECTION_CTX, "depth", 0)
+    prev_depth = getattr(_SELECTION_CTX, "depth", 0)
+    prev_sources = list(getattr(_SELECTION_CTX, "sources", []))
     _SELECTION_CTX.depth = 0
+    _SELECTION_CTX.sources = []
     try:
         yield
     finally:
-        _SELECTION_CTX.depth = prev
+        _SELECTION_CTX.depth = prev_depth
+        _SELECTION_CTX.sources = prev_sources
 
 
-def _reorder_profiles_for_default_walk(profiles_iterable) -> list:
+def _reorder_profiles_for_default_walk(profiles_iterable, source: str = "live") -> list:
     """
     Reorders an iterable of M3UAccountProfile instances for Dispatcharr callers that execute:
         default_profile = next((obj for obj in m3u_profiles if obj.is_default), None)
@@ -63,6 +82,18 @@ def _reorder_profiles_for_default_walk(profiles_iterable) -> list:
         or not ACTIVE_PLUGIN
         or not ACTIVE_PLUGIN.is_enabled()
     ):
+        if (
+            len(items) == 1
+            and hasattr(items[0], "is_default")
+            and ACTIVE_PLUGIN
+            and ACTIVE_PLUGIN.is_enabled()
+        ):
+            ACTIVE_PLUGIN._log_detail(
+                "[%s] %s: only 1 profile (%s), passthrough.",
+                source,
+                ACTIVE_PLUGIN._describe_account(None, items),
+                ACTIVE_PLUGIN._profile_label(items[0]),
+            )
         return items
 
     with _pause_selection_context():
@@ -73,9 +104,31 @@ def _reorder_profiles_for_default_walk(profiles_iterable) -> list:
         # preserve that condition so callers still detect `default_profile is None`.
         has_active_default = any(getattr(p, "is_default", False) for p in active_items)
         if not has_active_default or not active_items:
+            ACTIVE_PLUGIN._log_detail(
+                "[%s] %s: no active default profile found (%d active), passthrough.",
+                source,
+                ACTIVE_PLUGIN._describe_account(None, items),
+                len(active_items),
+            )
             return items
 
-        sorted_active = ACTIVE_PLUGIN.sort_profiles_least_used(active_items)
+        redis_client = ACTIVE_PLUGIN._get_redis_client()
+        if redis_client is None:
+            ACTIVE_PLUGIN._log_warning(
+                "[%s] %s: Redis unavailable, falling back to default linear order.",
+                source,
+                ACTIVE_PLUGIN._describe_account(None, items),
+            )
+            return items
+
+        sorted_active = ACTIVE_PLUGIN.sort_profiles_least_used(active_items, redis_client)
+        ACTIVE_PLUGIN._log_selection_decision(
+            source=source,
+            candidates_before=active_items,
+            sorted_active=sorted_active,
+            chosen_profile=sorted_active[0],
+            redis_client=redis_client,
+        )
 
         result = []
         for idx, prof in enumerate(sorted_active):
@@ -95,12 +148,13 @@ def _reorder_profiles_for_default_walk(profiles_iterable) -> list:
 
 class Plugin:
     name = "Trimarr"
-    version = "1.0.0"
+    version = "1.1.0"
     description = (
         "Load-balances provider connections across all active M3U account profiles "
         "using least-connections selection instead of linear failover."
     )
     author = "bruor"
+    help_url = "https://github.com/bruor/trimarr"
 
     fields = [
         {
@@ -133,6 +187,28 @@ class Plugin:
             "help_text": "How Trimarr breaks ties when multiple active profiles on a provider have the exact same lowest number of active connections.",
             "description": "How Trimarr breaks ties when multiple active profiles on a provider have the exact same lowest number of active connections.",
         },
+        {
+            "id": "log_level",
+            "label": "Logging Level",
+            "type": "select",
+            "default": "standard",
+            "options": [
+                {
+                    "value": "standard",
+                    "label": "Standard (Overrides, Lifecycle & Warnings)",
+                },
+                {
+                    "value": "verbose",
+                    "label": "Verbose (All Evaluations, Stickiness & Overrides)",
+                },
+                {
+                    "value": "errors",
+                    "label": "Errors Only (Warnings & Failures)",
+                },
+            ],
+            "help_text": "Controls what Trimarr writes to Dispatcharr's logs. Standard logs whenever Trimarr overrides the default profile order plus lifecycle and warning events; Verbose logs every profile evaluation.",
+            "description": "Controls what Trimarr writes to Dispatcharr's logs. Standard logs whenever Trimarr overrides the default profile order plus lifecycle and warning events; Verbose logs every profile evaluation.",
+        },
     ]
 
     actions = [
@@ -158,8 +234,35 @@ class Plugin:
         global ACTIVE_PLUGIN
         ACTIVE_PLUGIN = self
         self._cached_settings = {}
+        try:
+            self._folder_key = (
+                os.path.basename(os.path.dirname(os.path.abspath(__file__)))
+                .replace(" ", "_")
+                .lower()
+            )
+        except Exception:
+            self._folder_key = ""
         self._inject_hooks()
-        logger.info("[Trimarr] Plugin initialized and registered as active instance.")
+        hook_states = self._get_hook_states()
+        hook_summary = ", ".join(
+            f"{k}={'ok' if v else 'missing'}" for k, v in hook_states.items()
+        )
+        missing = [k for k, v in hook_states.items() if not v]
+        config = self._get_plugin_config()
+        tie_breaker = self.get_setting("tie_breaker", "default_first", _config=config)
+        log_level = self._get_log_level(_config=config)
+        self._log_lifecycle(
+            "Plugin initialized (tie_breaker=%s, log_level=%s, hooks=[%s]).",
+            tie_breaker,
+            log_level,
+            hook_summary,
+            log_level=log_level,
+        )
+        if missing:
+            self._log_warning(
+                "Some Dispatcharr hook targets were not found during initialization: %s",
+                ", ".join(missing),
+            )
 
     @staticmethod
     def _import_module(module_path: str):
@@ -204,6 +307,11 @@ class Plugin:
                     if config is not None:
                         return config
 
+                if getattr(self, "_folder_key", ""):
+                    config = PluginConfig.objects.filter(key=self._folder_key).first()
+                    if config is not None:
+                        return config
+
                 config = PluginConfig.objects.filter(key__iexact="trimarr").first()
                 if config is not None:
                     return config
@@ -245,18 +353,65 @@ class Plugin:
             return val.lower() in ("true", "1", "yes")
         return bool(val)
 
-    def get_profile_load_info(self, profile, redis_client=None) -> Tuple[int, bool]:
+    def _get_log_level(self, _config=None) -> str:
+        val = str(self.get_setting("log_level", "standard", _config=_config) or "standard").strip().lower()
+        return val if val in VALID_LOG_LEVELS else "standard"
+
+    def _log_lifecycle(self, msg: str, *args, log_level: Optional[str] = None, act_logger=None):
+        lvl = log_level or self._get_log_level()
+        target_logger = act_logger or logger
+        if lvl in ("standard", "verbose"):
+            target_logger.info(f"[Trimarr] {msg}", *args)
+        else:
+            target_logger.debug(f"[Trimarr] {msg}", *args)
+
+    def _log_detail(self, msg: str, *args, log_level: Optional[str] = None, act_logger=None):
+        lvl = log_level or self._get_log_level()
+        target_logger = act_logger or logger
+        if lvl == "verbose":
+            target_logger.info(f"[Trimarr] {msg}", *args)
+        else:
+            target_logger.debug(f"[Trimarr] {msg}", *args)
+
+    def _log_warning(self, msg: str, *args, act_logger=None):
+        (act_logger or logger).warning(f"[Trimarr] {msg}", *args)
+
+    @staticmethod
+    def _profile_label(profile) -> str:
+        name = getattr(profile, "name", None)
+        pid = getattr(profile, "id", None)
+        if name:
+            return f"'{name}' (id={pid})"
+        return f"profile (id={pid})"
+
+    @staticmethod
+    def _describe_account(account, profiles=()) -> str:
+        acct = account
+        if acct is None and profiles:
+            first = profiles[0]
+            acct = first.__dict__.get("m3u_account")
+            if acct is None and hasattr(first, "_state"):
+                acct = getattr(first._state, "fields_cache", {}).get("m3u_account")
+        if acct is not None:
+            name = getattr(acct, "name", None)
+            aid = getattr(acct, "id", None)
+            return f"Account '{name}' (id={aid})" if name else f"Account (id={aid})"
+        if profiles:
+            aid = getattr(profiles[0], "m3u_account_id", None)
+            if aid is not None:
+                return f"Account (id={aid})"
+        return "Account"
+
+    def _read_profile_pool_counts(self, profile, redis_client=None) -> Tuple[int, int, int, bool]:
         """
-        Returns `(effective_connections, has_capacity)` for an M3UAccountProfile.
-        Accounts for both the per-profile Redis counter (`profile_connections:{id}`)
-        and any shared ServerGroup credential counter (`server_group_connections:{group}:{fp}`).
+        Returns `(prof_count, cred_count, effective_count, has_capacity)` for a profile.
         """
         if redis_client is None:
             redis_client = self._get_redis_client()
 
         max_streams = getattr(profile, "max_streams", 0) or 0
         if redis_client is None:
-            return 0, True
+            return 0, 0, 0, True
 
         conn_pool = self._import_module("apps.m3u.connection_pool")
         if conn_pool is not None:
@@ -273,14 +428,113 @@ class Plugin:
             try:
                 has_cap = bool(conn_pool.pool_has_capacity_for_profile(profile, redis_client))
             except Exception:
-                has_cap = True if max_streams == 0 else (prof_count < max_streams)
+                has_cap = True if max_streams == 0 else (max(prof_count, cred_count) < max_streams)
 
-            return max(prof_count, cred_count), has_cap
+            return prof_count, cred_count, max(prof_count, cred_count), has_cap
 
         # Fallback if connection_pool module is unavailable
         prof_count = int(redis_client.get(f"profile_connections:{profile.id}") or 0)
         has_cap = True if max_streams == 0 else (prof_count < max_streams)
-        return prof_count, has_cap
+        return prof_count, 0, prof_count, has_cap
+
+    def get_profile_load_info(self, profile, redis_client=None) -> Tuple[int, bool]:
+        """
+        Returns `(effective_connections, has_capacity)` for an M3UAccountProfile.
+        Accounts for both the per-profile Redis counter (`profile_connections:{id}`)
+        and any shared ServerGroup credential counter (`server_group_connections:{group}:{fp}`).
+        """
+        _prof_count, _cred_count, effective_count, has_cap = self._read_profile_pool_counts(
+            profile, redis_client
+        )
+        return effective_count, has_cap
+
+    def _format_profile_load(self, profile, redis_client=None) -> str:
+        prof_count, cred_count, effective_count, _has_cap = self._read_profile_pool_counts(
+            profile, redis_client
+        )
+        max_streams = getattr(profile, "max_streams", 0) or 0
+        max_label = "inf" if max_streams == 0 else str(max_streams)
+        orig_default = getattr(
+            profile, "_trimarr_orig_is_default", getattr(profile, "is_default", False)
+        )
+        star = "*" if orig_default else ""
+        name = getattr(profile, "name", None) or f"id={getattr(profile, 'id', None)}"
+        if cred_count > prof_count:
+            return f"{name}{star}({effective_count}/{max_label}, local={prof_count}, group={cred_count})"
+        return f"{name}{star}({effective_count}/{max_label})"
+
+    def _log_selection_decision(
+        self,
+        *,
+        source: str,
+        candidates_before: List,
+        sorted_active: List,
+        chosen_profile=None,
+        account=None,
+        redis_client=None,
+        extra_note: Optional[str] = None,
+        all_at_capacity: Optional[bool] = None,
+    ) -> None:
+        config = self._get_plugin_config()
+        lvl = self._get_log_level(_config=config)
+        if lvl == "errors" and not logger.isEnabledFor(logging.DEBUG):
+            return
+        if not candidates_before or not sorted_active:
+            return
+
+        if all_at_capacity is None:
+            all_at_capacity = not any(
+                self.get_profile_load_info(p, redis_client)[1] for p in sorted_active
+            )
+
+        chosen = chosen_profile or sorted_active[0]
+        default_profile = next(
+            (
+                p
+                for p in candidates_before
+                if getattr(p, "_trimarr_orig_is_default", getattr(p, "is_default", False))
+            ),
+            candidates_before[0],
+        )
+        is_override = getattr(chosen, "id", None) != getattr(default_profile, "id", None)
+
+        # In standard mode, emit INFO for actual overrides (with capacity);
+        # keep all-at-capacity retries and kept-default checks at verbose/DEBUG.
+        emit_info = (is_override and not all_at_capacity and lvl in ("standard", "verbose")) or (
+            lvl == "verbose"
+        )
+        if not emit_info and not logger.isEnabledFor(logging.DEBUG):
+            return
+
+        tie_breaker = str(
+            self.get_setting("tie_breaker", "default_first", _config=config) or "default_first"
+        ).strip().lower()
+        acct_label = self._describe_account(account, sorted_active)
+        order_str = ", ".join(self._format_profile_load(p, redis_client) for p in sorted_active)
+        chosen_load = self._format_profile_load(chosen, redis_client)
+        def_load = self._format_profile_load(default_profile, redis_client)
+
+        if all_at_capacity:
+            action_desc = f"all profiles at capacity; candidate={chosen_load} vs default={def_load}"
+        elif is_override:
+            action_desc = (
+                f"OVERRIDE default {self._profile_label(default_profile)} [{def_load}] "
+                f"-> selected {self._profile_label(chosen)} [{chosen_load}]"
+            )
+        else:
+            action_desc = f"kept default {self._profile_label(chosen)} [{chosen_load}]"
+
+        extras = [f"tie_breaker={tie_breaker}"]
+        if extra_note:
+            extras.append(extra_note)
+        extras.append(f"order: {order_str}")
+
+        msg = "[Trimarr] [%s] %s: %s [%s]"
+        args = (source, acct_label, action_desc, "; ".join(extras))
+        if emit_info:
+            logger.info(msg, *args)
+        else:
+            logger.debug(msg, *args)
 
     def sort_profiles_least_used(self, profiles: Iterable, redis_client=None) -> List:
         """
@@ -357,6 +611,7 @@ class Plugin:
             if model_name != "M3UAccountProfile":
                 return orig_iter(qs_self)
 
+            selection_source = _current_selection_source()
             with _pause_selection_context():
                 if not ACTIVE_PLUGIN.is_enabled():
                     return orig_iter(qs_self)
@@ -369,7 +624,9 @@ class Plugin:
                     return iter(cached)
 
                 raw_items = list(orig_iter(qs_self))
-                reordered = _reorder_profiles_for_default_walk(raw_items)
+                reordered = _reorder_profiles_for_default_walk(
+                    raw_items, source=selection_source
+                )
                 try:
                     qs_self._trimarr_reordered_cache = reordered
                 except Exception:
@@ -396,7 +653,7 @@ class Plugin:
             def patched_channel_get_stream(channel_self, *args, **kwargs):
                 if not ACTIVE_PLUGIN or not ACTIVE_PLUGIN.is_enabled():
                     return orig_channel_get_stream(channel_self, *args, **kwargs)
-                with _profile_selection_context():
+                with _profile_selection_context(source="live:Channel.get_stream"):
                     return orig_channel_get_stream(channel_self, *args, **kwargs)
 
             patched_channel_get_stream._is_trimarr_patched = True
@@ -420,7 +677,7 @@ class Plugin:
                     return orig_stream_get_stream(
                         stream_self, preferred_profile_id=preferred_profile_id, *args, **kwargs
                     )
-                with _profile_selection_context():
+                with _profile_selection_context(source="live:Stream.get_stream"):
                     return orig_stream_get_stream(
                         stream_self, preferred_profile_id=preferred_profile_id, *args, **kwargs
                     )
@@ -446,18 +703,20 @@ class Plugin:
 
             orig_fn = getattr(url_utils, orig_attr)
 
-            def _make_wrapper(fn):
+            def _make_wrapper(name, fn):
+                src = f"live:{name}"
+
                 @wraps(fn)
                 def wrapped(*args, **kwargs):
                     if not ACTIVE_PLUGIN or not ACTIVE_PLUGIN.is_enabled():
                         return fn(*args, **kwargs)
-                    with _profile_selection_context():
+                    with _profile_selection_context(source=src):
                         return fn(*args, **kwargs)
 
                 wrapped._is_trimarr_patched = True
                 return wrapped
 
-            setattr(url_utils, fn_name, _make_wrapper(orig_fn))
+            setattr(url_utils, fn_name, _make_wrapper(fn_name, orig_fn))
 
     def _hook_vod_proxy_views(self):
         vod_views = self._import_module("apps.proxy.vod_proxy.views")
@@ -488,6 +747,10 @@ class Plugin:
 
             redis_client = ACTIVE_PLUGIN._get_redis_client()
             if redis_client is None:
+                ACTIVE_PLUGIN._log_warning(
+                    "[vod] %s: Redis unavailable, falling back to Dispatcharr profile selection.",
+                    ACTIVE_PLUGIN._describe_account(m3u_account),
+                )
                 return orig_get_m3u_profile(
                     m3u_account,
                     profile_id,
@@ -500,9 +763,18 @@ class Plugin:
             if session_id:
                 try:
                     conn_data = redis_client.hgetall(f"vod_persistent_connection:{session_id}")
-                    if conn_data and (
-                        conn_data.get("m3u_profile_id") or conn_data.get(b"m3u_profile_id")
-                    ):
+                    sticky_pid = conn_data.get("m3u_profile_id") or conn_data.get(
+                        b"m3u_profile_id"
+                    )
+                    if conn_data and sticky_pid:
+                        if isinstance(sticky_pid, bytes):
+                            sticky_pid = sticky_pid.decode("utf-8", errors="replace")
+                        ACTIVE_PLUGIN._log_detail(
+                            "[vod] %s: preserving sticky session '%s' on profile id=%s.",
+                            ACTIVE_PLUGIN._describe_account(m3u_account),
+                            session_id,
+                            sticky_pid,
+                        )
                         return orig_get_m3u_profile(
                             m3u_account,
                             profile_id,
@@ -531,6 +803,10 @@ class Plugin:
                 has_default = any(getattr(p, "is_default", False) for p in candidates)
                 if not has_default and restrict_to_profile_ids is None:
                     # Match Dispatcharr's requirement that unrestricted accounts have a default profile
+                    ACTIVE_PLUGIN._log_detail(
+                        "[vod] %s: no active default profile found, passthrough.",
+                        ACTIVE_PLUGIN._describe_account(m3u_account),
+                    )
                     return orig_get_m3u_profile(
                         m3u_account,
                         profile_id,
@@ -551,10 +827,32 @@ class Plugin:
                             restrict_to_profile_ids=restrict_to_profile_ids,
                         )
                         if result and result[0]:
+                            ACTIVE_PLUGIN._log_selection_decision(
+                                source="vod",
+                                candidates_before=candidates,
+                                sorted_active=sorted_candidates,
+                                chosen_profile=result[0],
+                                account=m3u_account,
+                                redis_client=redis_client,
+                                extra_note=f"session={session_id}" if session_id else None,
+                                all_at_capacity=False,
+                            )
                             return result
+
+                if sorted_candidates:
+                    ACTIVE_PLUGIN._log_selection_decision(
+                        source="vod",
+                        candidates_before=candidates,
+                        sorted_active=sorted_candidates,
+                        chosen_profile=sorted_candidates[0],
+                        account=m3u_account,
+                        redis_client=redis_client,
+                        extra_note=f"session={session_id}" if session_id else None,
+                        all_at_capacity=True,
+                    )
             except Exception as exc:
-                logger.warning(
-                    "[Trimarr] Error selecting least-used VOD profile, falling back: %s", exc
+                ACTIVE_PLUGIN._log_warning(
+                    "[vod] Error selecting least-used VOD profile, falling back: %s", exc
                 )
 
             return orig_get_m3u_profile(
@@ -613,6 +911,10 @@ class Plugin:
                     (p for p in m3u_profiles if getattr(p, "is_default", False)), None
                 )
                 if default_profile is None:
+                    ACTIVE_PLUGIN._log_detail(
+                        "[timeshift] %s: no active default profile found, passthrough.",
+                        ACTIVE_PLUGIN._describe_account(m3u_account),
+                    )
                     return orig_prepare(
                         catchup_stream,
                         timestamp=timestamp,
@@ -634,14 +936,36 @@ class Plugin:
                         profile=candidate,
                     )
                     if target is not None:
+                        if len(sorted_profiles) > 1:
+                            ACTIVE_PLUGIN._log_selection_decision(
+                                source="timeshift",
+                                candidates_before=m3u_profiles,
+                                sorted_active=sorted_profiles,
+                                chosen_profile=candidate,
+                                account=m3u_account,
+                                redis_client=redis_client,
+                                extra_note=f"timezone_profile={getattr(default_profile, 'name', '')}(id={default_profile.id})",
+                                all_at_capacity=False,
+                            )
                         return target, False
                     if capacity_blocked:
                         any_capacity_blocked = True
 
+                if sorted_profiles:
+                    ACTIVE_PLUGIN._log_selection_decision(
+                        source="timeshift",
+                        candidates_before=m3u_profiles,
+                        sorted_active=sorted_profiles,
+                        chosen_profile=sorted_profiles[0],
+                        account=m3u_account,
+                        redis_client=redis_client,
+                        extra_note=f"timezone_profile={getattr(default_profile, 'name', '')}(id={default_profile.id})",
+                        all_at_capacity=True,
+                    )
                 return None, any_capacity_blocked
             except Exception as exc:
-                logger.warning(
-                    "[Trimarr] Error in timeshift least-used profile walk, falling back: %s",
+                ACTIVE_PLUGIN._log_warning(
+                    "[timeshift] Error in timeshift least-used profile walk, falling back: %s",
                     exc,
                 )
                 return orig_prepare(
@@ -681,16 +1005,29 @@ class Plugin:
 
                 try:
                     redis_client = ACTIVE_PLUGIN._get_redis_client()
-                    if redis_client is not None:
+                    if redis_client is None:
+                        ACTIVE_PLUGIN._log_warning(
+                            "[allowlist] Redis unavailable, keeping Dispatcharr profile allowlist order."
+                        )
+                    else:
                         for account_id, prof_list in list(profiles_by_account.items()):
                             if len(prof_list) > 1:
-                                profiles_by_account[account_id] = (
-                                    ACTIVE_PLUGIN.sort_profiles_least_used(
-                                        prof_list, redis_client
-                                    )
+                                sorted_list = ACTIVE_PLUGIN.sort_profiles_least_used(
+                                    prof_list, redis_client
+                                )
+                                profiles_by_account[account_id] = sorted_list
+                                ACTIVE_PLUGIN._log_selection_decision(
+                                    source="allowlist",
+                                    candidates_before=prof_list,
+                                    sorted_active=sorted_list,
+                                    chosen_profile=sorted_list[0],
+                                    redis_client=redis_client,
                                 )
                 except Exception as exc:
-                    logger.debug("[Trimarr] Error sorting allowed M3U profiles: %s", exc)
+                    ACTIVE_PLUGIN._log_warning(
+                        "[allowlist] Error sorting allowed M3U profiles, keeping default order: %s",
+                        exc,
+                    )
 
                 return profiles_by_account
 
@@ -750,10 +1087,15 @@ class Plugin:
                 m3u_utils._trimarr_orig_get_allowed_m3u_profiles
             )
 
+        reason = context.get("reason") if isinstance(context, dict) else None
+        self._log_lifecycle(
+            "Plugin stopped and original hooks restored (reason=%s).",
+            reason or "unspecified",
+            act_logger=(context or {}).get("logger") if isinstance(context, dict) else None,
+        )
+
         if ACTIVE_PLUGIN is self:
             ACTIVE_PLUGIN = None
-
-        logger.info("[Trimarr] Plugin stopped and original hooks restored (context=%s).", context)
 
     def _get_hook_states(self) -> dict:
         states = {}
@@ -808,17 +1150,29 @@ class Plugin:
         """
         Handles synchronous administrative actions triggered from the Dispatcharr UI.
         """
+        act_logger = (context or {}).get("logger") or logger
         if context and isinstance(context.get("settings"), dict):
             self._cached_settings.update(context["settings"])
 
         if action == "status_check":
             hook_states = self._get_hook_states()
             any_hooked = any(hook_states.values())
+            config = self._get_plugin_config()
             enabled = self.is_enabled()
-            tie_breaker = self.get_setting("tie_breaker", "default_first")
+            tie_breaker = self.get_setting("tie_breaker", "default_first", _config=config)
+            log_level = self._get_log_level(_config=config)
 
             hook_summary = ", ".join(
                 f"{k}={'ok' if v else 'unhooked'}" for k, v in hook_states.items()
+            )
+            self._log_lifecycle(
+                "Action status_check: enabled=%s, hooked=%s, tie_breaker=%s, log_level=%s",
+                enabled,
+                any_hooked,
+                tie_breaker,
+                log_level,
+                log_level=log_level,
+                act_logger=act_logger,
             )
             return {
                 "status": "ok",
@@ -826,9 +1180,10 @@ class Plugin:
                 "is_hooked": any_hooked,
                 "hook_states": hook_states,
                 "tie_breaker": tie_breaker,
+                "log_level": log_level,
                 "message": (
                     f"Trimarr is {'ACTIVE' if (enabled and any_hooked) else 'DISABLED or unhooked'} "
-                    f"(tie_breaker={tie_breaker}). "
+                    f"(tie_breaker={tie_breaker}, log_level={log_level}). "
                     f"Hooks: [{hook_summary}]"
                 ),
             }
@@ -898,12 +1253,14 @@ class Plugin:
                     if lines
                     else "No active M3U accounts with active profiles found."
                 )
+                self._log_detail("Action inspect_profiles: %s", msg, act_logger=act_logger)
                 return {
                     "status": "ok",
                     "accounts": account_summaries,
                     "message": msg,
                 }
             except Exception as exc:
+                act_logger.exception("[Trimarr] Failed to inspect profiles: %s", exc)
                 return {
                     "status": "error",
                     "error": f"Failed to inspect profiles: {exc}",

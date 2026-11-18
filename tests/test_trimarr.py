@@ -1,3 +1,5 @@
+import json
+import os
 import sys
 import types
 import unittest
@@ -643,6 +645,82 @@ class TestTrimarrPlugin(unittest.TestCase):
         mock_config.settings = {"enabled": False, "tie_breaker": "default_first"}
         _, p3, _, _ = chan.get_stream()
         self.assertEqual(p3, 101)
+
+    def test_manifest_v2_and_action_results_json_safe(self):
+        """
+        Verify Dispatcharr 0.34+ manifest_version=2 metadata, capability declarations,
+        authoritative plugin.json/Plugin parity, and strict JSON action serialization.
+        """
+        manifest_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plugin.json"
+        )
+        with open(manifest_path, "r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+
+        self.assertEqual(manifest.get("manifest_version"), 2)
+        self.assertEqual(manifest.get("capabilities"), ["proxy_internals"])
+        self.assertEqual(manifest.get("name"), self.plugin.name)
+        self.assertEqual(manifest.get("version"), self.plugin.version)
+        self.assertEqual(manifest.get("help_url"), self.plugin.help_url)
+        self.assertEqual(manifest.get("fields"), self.plugin.fields)
+        self.assertEqual(manifest.get("actions"), self.plugin.actions)
+
+        for action_id in ("status_check", "inspect_profiles", "unknown_action"):
+            res = self.plugin.run(action_id, {}, {"settings": {}})
+            # Matches Dispatcharr 0.34+ run_plugin_action_task check
+            encoded = json.dumps(res, allow_nan=False)
+            self.assertIsInstance(encoded, str)
+
+    def test_logging_levels_standard_verbose_and_errors(self):
+        """
+        Verify standard/verbose/errors log_level filtering, single-emit per QuerySet
+        evaluation, ServerGroup annotation, and VOD stickiness logging.
+        """
+        Channel = sys.modules["apps.channels.models"].Channel
+        vod_views = sys.modules["apps.proxy.vod_proxy.views"]
+        chan = Channel(self.account)
+
+        # 1. Standard (default): kept-default is suppressed at INFO; override logs ONCE at INFO
+        self.plugin._cached_settings["log_level"] = "standard"
+        with self.assertLogs(self.plugin_mod.logger, level="INFO") as cm:
+            # Stream 1 keeps default (cred1, 0/3) -> NOT logged at INFO
+            _, p1, _, _ = chan.get_stream()
+            # Stream 2 overrides default -> cred2 (0/3) -> logged ONCE at INFO
+            _, p2, _, _ = chan.get_stream()
+        self.assertEqual([p1, p2], [101, 102])
+        override_logs = [m for m in cm.output if "OVERRIDE default" in m]
+        kept_logs = [m for m in cm.output if "kept default" in m]
+        self.assertEqual(len(override_logs), 1)
+        self.assertEqual(len(kept_logs), 0)
+        self.assertIn("[live:Channel.get_stream]", override_logs[0])
+        self.assertIn("'cred2'", override_logs[0])
+        self.assertIn("'cred1_default'", override_logs[0])
+
+        # 2. Verbose: kept-default, sticky VOD session, and ServerGroup annotation log at INFO
+        self.plugin._cached_settings["log_level"] = "verbose"
+        self.fake_redis.set("profile_connections:101", 2)
+        self.fake_redis.set("profile_connections:102", 0)
+        self.cred_counts[102] = 2  # ServerGroup effective load = 2/3
+        self.fake_redis.set("profile_connections:103", 1)
+        self.fake_redis.hset("vod_persistent_connection:sticky-sess", "m3u_profile_id", "101")
+
+        with self.assertLogs(self.plugin_mod.logger, level="INFO") as cm_verbose:
+            _, selected_id, _, _ = chan.get_stream()
+            vod_views._get_m3u_profile(self.account, None, session_id="sticky-sess")
+        self.assertEqual(selected_id, 103)
+        joined = "\n".join(cm_verbose.output)
+        self.assertIn("local=0, group=2", joined)
+        self.assertIn("preserving sticky session 'sticky-sess'", joined)
+
+        # 3. Errors only: suppresses INFO decisions while keeping WARNING on Redis unavailability
+        self.plugin._cached_settings["log_level"] = "errors"
+        sys.modules["core.utils"].RedisClient.get_client.return_value = None
+        with self.assertLogs(self.plugin_mod.logger, level="INFO") as cm_err:
+            _, p_fallback, _, _ = chan.get_stream()
+        self.assertEqual(p_fallback, 101)
+        self.assertEqual(len(cm_err.output), 1)
+        self.assertIn("WARNING:", cm_err.output[0])
+        self.assertIn("Redis unavailable", cm_err.output[0])
 
 
 if __name__ == "__main__":

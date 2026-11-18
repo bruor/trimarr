@@ -1,8 +1,13 @@
 {
+  "manifest_version": 2,
   "name": "Trimarr",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Load-balances provider connections across all active M3U account profiles using least-connections selection instead of linear failover.",
   "author": "bruor",
+  "help_url": "https://github.com/bruor/trimarr",
+  "capabilities": [
+    "proxy_internals"
+  ],
   "fields": [
     {
       "id": "enabled",
@@ -33,6 +38,28 @@
       ],
       "help_text": "How Trimarr breaks ties when multiple active profiles on a provider have the exact same lowest number of active connections.",
       "description": "How Trimarr breaks ties when multiple active profiles on a provider have the exact same lowest number of active connections."
+    },
+    {
+      "id": "log_level",
+      "label": "Logging Level",
+      "type": "select",
+      "default": "standard",
+      "options": [
+        {
+          "value": "standard",
+          "label": "Standard (Overrides, Lifecycle & Warnings)"
+        },
+        {
+          "value": "verbose",
+          "label": "Verbose (All Evaluations, Stickiness & Overrides)"
+        },
+        {
+          "value": "errors",
+          "label": "Errors Only (Warnings & Failures)"
+        }
+      ],
+      "help_text": "Controls what Trimarr writes to Dispatcharr's logs. Standard logs whenever Trimarr overrides the default profile order plus lifecycle and warning events; Verbose logs every profile evaluation.",
+      "description": "Controls what Trimarr writes to Dispatcharr's logs. Standard logs whenever Trimarr overrides the default profile order plus lifecycle and warning events; Verbose logs every profile evaluation."
     }
   ],
   "actions": [
